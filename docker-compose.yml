@@ -1,0 +1,45 @@
+# 显微成像原片加密数仓 —— 单实例 API + 独立持久化密钥服务
+# 启动： docker compose up --build
+# Swagger:
+#   API:        http://localhost:8000/docs
+#   密钥服务:    http://localhost:8001/docs （生产环境请勿对公网暴露）
+services:
+  keystore:
+    build: ./keystore
+    image: microscopy/keystore:1.0.0
+    restart: unless-stopped
+    environment:
+      # 内部服务间令牌；生产部署请改成强随机值（两个服务必须一致）
+      KEY_SERVICE_TOKEN: "${KEY_SERVICE_TOKEN:-change-me-please-32bytes-token}"
+      # 密钥操作人为延迟（秒），用于演练慢密钥服务；正常设 0
+      KEY_OP_DELAY: "${KEY_OP_DELAY:-0}"
+      # 销毁主密钥成功后故意丢弃 HTTP 回执（演练回执丢失自动核实接续）
+      KEY_DESTROY_DROP_RECEIPT: "${KEY_DESTROY_DROP_RECEIPT:-false}"
+      KEYSTORE_DB: "/data/keystore.db"
+    volumes:
+      - keystore-data:/data
+    ports:
+      - "127.0.0.1:8001:8001"
+
+  api:
+    build: ./api
+    image: microscopy/image-api:1.0.0
+    restart: unless-stopped
+    depends_on:
+      - keystore
+    environment:
+      KEY_SERVICE_URL: "http://keystore:8001"
+      KEY_SERVICE_TOKEN: "${KEY_SERVICE_TOKEN:-change-me-please-32bytes-token}"
+      METADATA_DB: "/data/metadata.db"
+      BLOB_DIR: "/data/blobs"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-21474836480}"
+      # 僵死在途上传超时（秒），超时判失败以保证轮换可推进
+      UPLOAD_STALE_SECONDS: "${UPLOAD_STALE_SECONDS:-3600}"
+    volumes:
+      - api-data:/data
+    ports:
+      - "8000:8000"
+
+volumes:
+  keystore-data:
+  api-data:
