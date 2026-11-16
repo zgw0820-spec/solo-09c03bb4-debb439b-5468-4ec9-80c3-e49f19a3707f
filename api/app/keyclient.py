@@ -79,7 +79,9 @@ class KeyClient:
         return await self._request("GET", "/internal/master/status")
 
     async def rotate_master(self) -> dict:
-        # 同一幂等令牌贯穿重试，避免响应丢失后重复生成主密钥
+        # 同一幂等令牌贯穿本调用的所有网络重试：即使首包在密钥服务已生效后
+        # 丢回执，重试也命中密钥服务的幂等缓存、返回同一次轮换结果，
+        # 绝不会因为重试再生成一把新主密钥。每次逻辑调用换新令牌。
         token = f"rotate-{uuid.uuid4()}"
         return await self._request(
             "POST", "/internal/master/rotate",

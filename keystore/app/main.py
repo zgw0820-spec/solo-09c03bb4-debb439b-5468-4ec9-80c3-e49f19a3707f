@@ -8,6 +8,7 @@
 可配置故障注入（用于演练"回执丢失"与慢操作）：
   KEY_OP_DELAY               每个写/密码学操作人为延迟秒数（慢密钥服务）
   KEY_DESTROY_DROP_RECEIPT   销毁主密钥成功后不回 HTTP 响应（模拟回执丢失）
+  KEY_ROTATE_DROP_RECEIPT    轮换切换成功后不回 HTTP 响应（模拟轮换回执不明）
   KEY_SERVICE_TOKEN          内部服务间鉴权令牌（必填，默认随机仅用于本地）
   KEYSTORE_DB                SQLite 路径（默认 /data/keystore.db，需持久卷）
 """
@@ -30,6 +31,12 @@ SERVICE_TOKEN = os.environ.get("KEY_SERVICE_TOKEN", "dev-only-key-service-token"
 OP_DELAY = float(os.environ.get("KEY_OP_DELAY", "0"))
 DESTROY_DROP_RECEIPT = os.environ.get(
     "KEY_DESTROY_DROP_RECEIPT", "false").lower() in ("1", "true", "yes")
+# true/yes/1：仅首次调用丢回执（幂等重放可恢复）；always：连幂等重放也丢，
+# 用于演练客户端重试耗尽、只能靠只读状态核实的"回执不明"场景。
+ROTATE_DROP_RECEIPT = os.environ.get(
+    "KEY_ROTATE_DROP_RECEIPT", "false").lower() in ("1", "true", "yes", "always")
+ROTATE_DROP_RECEIPT_ALWAYS = os.environ.get(
+    "KEY_ROTATE_DROP_RECEIPT", "false").lower() == "always"
 
 app = FastAPI(
     title="Microscopy Key Service",
@@ -104,8 +111,16 @@ async def rotate_master(x_key_service_token: str | None = Header(default=None),
                         x_idempotency_token: str | None = Header(default=None)):
     _check_token(x_key_service_token)
     await _delay()
-    return store.rotate_master(
+    result = store.rotate_master(
         x_idempotency_token or f"auto-{uuid.uuid4()}")
+    # 故障注入：轮换已落盘并切换 current，但客户端拿不到完整 HTTP 回执。
+    # 默认仅首次调用丢（幂等重放可恢复）；always 模式连重放也丢，
+    # 迫使调用方重试耗尽后走只读状态核实/对账接续。
+    drop = ROTATE_DROP_RECEIPT and (
+        ROTATE_DROP_RECEIPT_ALWAYS or not result.get("idempotent"))
+    if drop:
+        return _DropReceiptResponse(result, status_code=200)
+    return result
 
 
 @app.post("/internal/master/destroy", summary="销毁指定主密钥（幂等）")

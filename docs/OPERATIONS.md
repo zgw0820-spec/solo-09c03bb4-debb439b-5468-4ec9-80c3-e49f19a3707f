@@ -30,26 +30,38 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 # 轮询 GET /rotations/{job_id}，state 终态：completed / failed
 ```
 
-状态机：`migrating`（逐信封 rewrap，blob 正文不动）→ `destroying`
-（零残留核验 + 销毁旧 MK + 只读核实）→ `completed`。
-进行中再次发起轮换返回 409。作业失败时先查 `error` 字段，修复后
-（通常是密钥服务暂时不可达）重启 API 即可自动接续，无需手工干预。
+状态机：`pending`（受理占位，调用密钥服务切换前先落库）→ `migrating`
+（逐信封 rewrap，blob 正文不动）→ `destroying`（零残留核验 + 销毁旧 MK +
+只读核实）→ `completed`。并发发起只有一笔被受理（202），其余返回 409
+`rotation_in_progress` 且不会再触发密钥切换。作业失败时先查 `error` 字段，
+修复后（通常是密钥服务暂时不可达）重启 API 即可自动接续，无需手工干预。
+
+受理回执中 `reconciled=true` 表示该作业不是由本次请求直接切换产生，而是
+受理时核实到密钥服务已存在未登记的切换（崩溃窗口/回执不明/外部切换），
+系统已为其补登记并接续迁移销毁。
 
 ## 4. 故障演练开关（keystore）
 
 - `KEY_OP_DELAY=<秒>`：模拟慢密钥服务，验证在线流量不被轮换拖死。
 - `KEY_DESTROY_DROP_RECEIPT=true`：销毁落盘后丢弃 HTTP 回执，验证 API
   自动重试 + 只读状态核实、作业仍如实报 completed。
+- `KEY_ROTATE_DROP_RECEIPT=true`：轮换落盘后丢弃首包回执，幂等重放可恢复。
+- `KEY_ROTATE_DROP_RECEIPT=always`：连幂等重放也丢，API 重试耗尽后通过
+  只读状态核实切换是否生效：生效则回填 pending 占位返回 202(reconciled)，
+  未生效则占位判 failed、受理位释放，两种情况都不会重复切换密钥。
 
 ## 5. 崩溃/重启语义
 
 | 场景 | 行为 |
 |---|---|
 | API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布）；blob 残片可按 failed 行清理 |
-| API 在轮换中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
-| 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
+| API 崩溃于轮换受理窗口（pending 占位） | 重启核实密钥服务真相：切换已生效则回填接续；未生效则占位判 failed 释放受理位 |
+| API 在迁移/销毁中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
+| 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业；运行期 worker 每 5 秒周期对账兜底 |
+| 连续多代切换未登记 | 对账按密钥代际逐代补建，每次只跑一个作业，链条收敛至只剩当前 MK active |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
-| 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |
+| 销毁/轮换回执丢失 | KeyClient 复用同一幂等令牌重试，并以 `/internal/master/status` 只读核实 |
+| 旧版本元数据库 | 启动时在线迁移 rotation_jobs（引入 pending 态），历史作业保留 |
 
 ## 6. 已知限制（单实例/SQLite 范围之外）
 

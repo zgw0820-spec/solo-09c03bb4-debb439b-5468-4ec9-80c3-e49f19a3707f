@@ -34,12 +34,16 @@ MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
 from .keyclient import KeyClient, KeyServiceError
 from .metadata import MetadataDB
-from .rotation import RotationWorker
+from .rotation import (RotationWorker, reconcile_rotations,
+                       recover_pending_rotations)
 
 db = MetadataDB(DB_PATH)
 keys = KeyClient(KEY_SERVICE_URL, KEY_SERVICE_TOKEN)
 worker: RotationWorker | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
+# 轮换受理锁：把"检查在途作业 -> 密钥服务切换 -> 本地登记"串行化，
+# 保证并发请求只有一笔真正触发密钥切换，其余明确 409 且不再切密钥。
+rotation_accept_lock = asyncio.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -61,19 +65,18 @@ async def lifespan(app: FastAPI):
     stale = db.mark_stale_receiving_failed()
     if stale:
         print(f"[startup] {stale} interrupted upload(s) marked failed")
-    # 崩溃对账：上次可能已在密钥服务切换了 MK、却没来得及建本地作业
+    # 崩溃对账，分两步，均为幂等，顺序不可颠倒：
+    #  1) 密钥服务已切换 MK、本地却没有任何作业（更窄的崩溃窗口/外部切换）：
+    #     按真实代际补建迁移/销毁作业。与运行期受理前、worker 周期对账同源。
+    #  2) 受理窗口崩溃留下的 pending 占位：核实密钥服务是否真有未登记切换，
+    #     有则回填接续、无则判失败，避免占位永久占用受理位。
+    # 先 1 后 2：pending 会占用唯一的活跃作业位，先让对账认领无主切换，
+    # pending 恢复时才不会把多代际链条误判为"切换未生效"。
     try:
-        key_status = await keys.master_status()
-        current_mk = key_status.get("current_key_id")
-        for key in key_status.get("keys", []):
-            if (key["key_id"] != current_mk
-                    and key["state"] == "active"
-                    and not db.has_rotation_for(key["key_id"])):
-                job_id = db.create_rotation(
-                    key["key_id"], current_mk,
-                    db.count_under_key(key["key_id"], only_migratable=True))
-                print(f"[startup] reconciled missing rotation job {job_id} "
-                      f"for {key['key_id']}")
+        for job_id in await reconcile_rotations(db, keys, ignore_pending=True):
+            print(f"[startup] reconciled missing rotation job {job_id}")
+        for job_id in await recover_pending_rotations(db, keys):
+            print(f"[startup] recovered pending rotation job {job_id}")
     except KeyServiceError as exc:
         print(f"[startup] rotation reconciliation skipped: {exc}")
     worker = RotationWorker(db, keys, main_loop)
@@ -121,12 +124,13 @@ async def _finalize_with_rebind(image_id: str, stats: dict[str, Any]) -> dict[st
     """最终化原片；若其 MK 在上传期间已被轮换切换，则先 rewrap 改绑当前 MK。
 
     是否需要改绑只依据本地轮换记录判断（不额外依赖密钥服务在线）：
-    该行绑定的正是最近一次轮换的旧 MK 时，说明它是跨越轮换的在途上传。
+    该行绑定的 MK 已出现在某笔轮换作业的旧 MK 列中，即说明它是跨越
+    轮换（可能跨多代）的在途上传，必须改绑到当前 MK。只比对最近一笔作业
+    会在连续多代轮换时漏判，故用 has_rotation_for 按全部代际判断。
     防止在途上传晚发布依赖旧（甚至已销毁）主密钥的原片。
     """
     meta = db.get_image(image_id)
-    job = db.latest_rotation()
-    if job and meta and meta["master_key_id"] == job["old_key_id"]:
+    if meta and db.has_rotation_for(meta["master_key_id"]):
         try:
             res = await keys.rewrap(meta["master_key_id"], meta["wrapped_dek"],
                                     f"finalize:{image_id}")
@@ -337,24 +341,89 @@ class RotationRequest(BaseModel):
     confirm: bool = True
 
 
+def _rotation_receipt(job: dict, reconciled: bool = False) -> dict:
+    return {"job_id": job["job_id"], "state": job["state"],
+            "old_key_id": job["old_key_id"], "new_key_id": job["new_key_id"],
+            "total_to_migrate": job["total"], "reconciled": reconciled}
+
+
 @app.post("/rotations", status_code=202,
-          summary="发起主密钥轮换（迁移信封后销毁旧 MK；未完拒绝新轮换）")
+          summary="发起主密钥轮换（迁移信封后销毁旧 MK；并发只受理一次）")
 async def create_rotation(_: RotationRequest):
-    active = db.active_rotation()
-    if active is not None:
-        raise HTTPException(
-            409, detail={"code": "rotation_in_progress",
-                         "job_id": active["job_id"], "state": active["state"]})
-    try:
-        rot = await keys.rotate_master()  # 新入湖立即改用新 MK
+    # 受理全程串行：并发请求在锁外排队，持锁后重新检查在途作业，
+    # 被拒请求不会调用密钥服务 rotate，因此绝不可能再切一次密钥。
+    async with rotation_accept_lock:
+        active = db.active_rotation()  # 含 pending 占位
+        if active is not None:
+            raise HTTPException(
+                409, detail={"code": "rotation_in_progress",
+                             "job_id": active["job_id"], "state": active["state"]})
+
+        # 受理前先核实密钥服务真实代际：若切换已生效而本地缺登记
+        # （崩溃窗口/回执不明/外部直接切换），补建并接续，而不是再切一次。
+        try:
+            recovered = await reconcile_rotations(db, keys)
+        except KeyServiceError as exc:
+            raise _key_error(exc)
+        if recovered:
+            active = db.get_rotation(recovered[0])
+            raise HTTPException(
+                409, detail={"code": "rotation_in_progress",
+                             "job_id": active["job_id"], "state": active["state"],
+                             "reconciled": True})
+
+        # 先落 pending 占位作为本次受理的持久凭证：worker 对账与并发请求
+        # 都会看到它而不再介入同一窗口；进程此刻崩溃也能在重启时被恢复。
+        job_id = db.create_pending_rotation()
+        try:
+            rot = await keys.rotate_master()  # 新入湖立即改用新 MK
+        except KeyServiceError as exc:
+            # 回执不明（重试耗尽）：切换可能已在密钥服务生效。
+            # 只读核实真实代际（容忍短暂连接抖动）：核实到未登记切换就
+            # 回填本占位并按正常受理返回；核实不到则判失败释放受理位。
+            for verify_attempt in range(3):
+                try:
+                    status = await keys.master_status()
+                    break
+                except KeyServiceError:
+                    if verify_attempt == 2:
+                        db.fail_rotation(job_id, f"rotate receipt unknown and key "
+                                                 f"service unreadable: {exc.code}")
+                        raise _key_error(exc)
+                    await asyncio.sleep(0.5 * (verify_attempt + 1))
+            current = status.get("current_key_id")
+            unregistered = next((
+                k for k in status.get("keys", [])
+                if k["key_id"] != current and k["state"] == "active"
+                and not db.has_rotation_for(k["key_id"])), None)
+            if unregistered is not None and current:
+                total = db.count_under_key(unregistered["key_id"],
+                                           only_migratable=True)
+                db.fill_rotation(job_id, unregistered["key_id"], current, total)
+                job = db.get_rotation(job_id)
+                return _rotation_receipt(job, reconciled=True)
+            db.fail_rotation(job_id, f"rotate failed without verifiable switch: "
+                                     f"{exc.code} {exc.message}")
+            raise _key_error(exc)
+
         old_key, new_key = rot["old_key_id"], rot["new_key_id"]
         total = (db.count_under_key(old_key, only_migratable=True)
                  if old_key else 0)
-        job_id = db.create_rotation(old_key, new_key, total)
-    except KeyServiceError as exc:
-        raise _key_error(exc)
-    return {"job_id": job_id, "state": "migrating", "old_key_id": old_key,
-            "new_key_id": new_key, "total_to_migrate": total}
+        # 回填并转 migrating；若占位已被启动恢复接管（理论上单实例不会），
+        # 按在途作业返回 409 而不是重复登记。
+        try:
+            db.fill_rotation(job_id, old_key, new_key, total)
+        except RuntimeError:
+            active = db.active_rotation()
+            if active is not None:
+                raise HTTPException(
+                    409, detail={"code": "rotation_in_progress",
+                                 "job_id": active["job_id"],
+                                 "state": active["state"],
+                                 "reconciled": True})
+            raise
+        job = db.get_rotation(job_id)
+    return _rotation_receipt(job)
 
 
 @app.get("/rotations/latest", summary="查询最近一次轮换进度")

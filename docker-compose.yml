@@ -15,6 +15,9 @@ services:
       KEY_OP_DELAY: "${KEY_OP_DELAY:-0}"
       # 销毁主密钥成功后故意丢弃 HTTP 回执（演练回执丢失自动核实接续）
       KEY_DESTROY_DROP_RECEIPT: "${KEY_DESTROY_DROP_RECEIPT:-false}"
+      # 轮换切换成功后故意丢弃 HTTP 回执：true=仅丢首包（重放可恢复），
+      # always=连幂等重放也丢（演练重试耗尽后的只读核实/对账接续）
+      KEY_ROTATE_DROP_RECEIPT: "${KEY_ROTATE_DROP_RECEIPT:-false}"
       KEYSTORE_DB: "/data/keystore.db"
     volumes:
       - keystore-data:/data

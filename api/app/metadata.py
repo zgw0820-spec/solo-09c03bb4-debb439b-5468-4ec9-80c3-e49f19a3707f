@@ -36,9 +36,9 @@ CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
 CREATE TABLE IF NOT EXISTS rotation_jobs (
     job_id          TEXT PRIMARY KEY,
     state           TEXT NOT NULL CHECK (state IN
-                        ('migrating','destroying','completed','failed')),
-    old_key_id      TEXT NOT NULL,
-    new_key_id      TEXT NOT NULL,
+                        ('pending','migrating','destroying','completed','failed')),
+    old_key_id      TEXT,
+    new_key_id      TEXT,
     total           INTEGER NOT NULL DEFAULT 0,
     migrated        INTEGER NOT NULL DEFAULT 0,
     failed          INTEGER NOT NULL DEFAULT 0,
@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
 """
 
 TERMINAL_STATES = ("completed", "failed")
+# worker 只驱动这两个执行态；pending 是受理占位（轮换调用进行中），
+# 由受理端点在拿到密钥服务结果后转 migrating，worker 不得驱动它。
+WORKER_STATES = ("migrating", "destroying")
 
 
 class MetadataDB:
@@ -62,8 +65,38 @@ class MetadataDB:
         self._local = threading.local()
         conn = self._connect()
         conn.executescript(SCHEMA)
+        self._migrate(conn)
         conn.commit()
         conn.close()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """旧版本库升级：引入 pending 受理态并放开 old/new_key_id 的 NOT NULL。"""
+        cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(rotation_jobs)").fetchall()}
+        if not cols:
+            return
+        states = [r[0] for r in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='rotation_jobs'").fetchall()]
+        ddl = states[0] if states else ""
+        if "'pending'" not in ddl:
+            conn.execute(
+                "UPDATE rotation_jobs SET state='migrating' WHERE state NOT IN "
+                "('migrating','destroying','completed','failed')")
+            conn.execute(
+                "CREATE TABLE rotation_jobs_new ( "
+                "job_id TEXT PRIMARY KEY, state TEXT NOT NULL CHECK (state IN "
+                "('pending','migrating','destroying','completed','failed')), "
+                "old_key_id TEXT, new_key_id TEXT, total INTEGER NOT NULL DEFAULT 0, "
+                "migrated INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, "
+                "error TEXT, started_at REAL NOT NULL, updated_at REAL NOT NULL, "
+                "finished_at REAL)")
+            conn.execute(
+                "INSERT INTO rotation_jobs_new SELECT job_id, state, old_key_id, "
+                "new_key_id, total, migrated, failed, error, started_at, updated_at, "
+                "finished_at FROM rotation_jobs")
+            conn.execute("DROP TABLE rotation_jobs")
+            conn.execute("ALTER TABLE rotation_jobs_new RENAME TO rotation_jobs")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30,
@@ -188,16 +221,56 @@ class MetadataDB:
             return cur.rowcount
 
     # ---- 轮换作业 -------------------------------------------------------
-    def active_rotation(self) -> dict | None:
+    def active_rotation(self, include_pending: bool = True) -> dict | None:
+        """返回未到终态的作业。include_pending=False 时只看 worker 执行态。"""
+        states = ("migrating", "destroying")
+        if include_pending:
+            states = ("pending",) + states
+        marks = ",".join("?" for _ in states)
         row = self.conn.execute(
-            "SELECT * FROM rotation_jobs WHERE state NOT IN ('completed','failed')"
-        ).fetchone()
+            f"SELECT * FROM rotation_jobs WHERE state IN ({marks})",
+            states).fetchone()
         return dict(row) if row else None
 
-    def create_rotation(self, old_key_id: str, new_key_id: str,
-                        total: int) -> str:
+    def create_pending_rotation(self) -> str:
+        """先登记 pending 占位作为受理凭证：并发受理与 worker 对账都以它为准。
+
+        密钥代际（old/new_key_id）在轮换调用返回后再回填，因此两者先置 NULL。
+        """
         with self._write_lock:
             if self.active_rotation() is not None:
+                raise RuntimeError("rotation already in progress")
+            job_id = "rot-" + uuid.uuid4().hex
+            now = time.time()
+            self.conn.execute(
+                "INSERT INTO rotation_jobs (job_id, state, total, migrated, "
+                "failed, started_at, updated_at) "
+                "VALUES (?, 'pending', 0, 0, 0, ?, ?)",
+                (job_id, now, now))
+            self.conn.commit()
+            return job_id
+
+    def fill_rotation(self, job_id: str, old_key_id: str | None,
+                      new_key_id: str, total: int) -> None:
+        """回填轮换结果并转入 migrating；找不到 pending 行则抛错。"""
+        with self._write_lock:
+            cur = self.conn.execute(
+                "UPDATE rotation_jobs SET old_key_id=?, new_key_id=?, total=?, "
+                "state='migrating', updated_at=? WHERE job_id=? AND state='pending'",
+                (old_key_id, new_key_id, total, time.time(), job_id))
+            self.conn.commit()
+            if cur.rowcount == 0:
+                raise RuntimeError(f"pending rotation {job_id} not found")
+
+    def fail_rotation(self, job_id: str, error: str) -> None:
+        """pending 受理失败（且核实不到已生效切换）时终结占位作业。"""
+        self.bump_rotation(job_id, state="failed", error=error)
+
+    def create_rotation(self, old_key_id: str, new_key_id: str, total: int,
+                        ignore_pending: bool = False) -> str:
+        with self._write_lock:
+            if self.active_rotation(
+                    include_pending=not ignore_pending) is not None:
                 raise RuntimeError("rotation already in progress")
             job_id = "rot-" + uuid.uuid4().hex
             now = time.time()
@@ -224,6 +297,11 @@ class MetadataDB:
             "SELECT * FROM rotation_jobs ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+    def all_rotations(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM rotation_jobs ORDER BY started_at").fetchall()
+        return [dict(r) for r in rows]
 
     def bump_rotation(self, job_id: str, migrated: int = 0, failed: int = 0,
                       state: str | None = None, error: str | None = None) -> None:
